@@ -5,7 +5,9 @@ vertex FragmentIn singleStageSplatVertexShader(uint vertexID [[vertex_id]],
                                                ushort amplificationID [[amplification_id]],
                                                device const ChunkInfo* chunks [[ buffer(BufferIndexChunks) ]],
                                                constant ChunkedSplatIndex* splatIndexArray [[ buffer(BufferIndexSplatIndex) ]],
-                                               constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]]) {
+                                               constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]],
+                                               constant ViewCutsUniforms & cuts [[ buffer(BufferIndexViewCuts) ]],
+                                               texture2d<float> hullTex [[ texture(TextureIndexHull) ]]) {
     Uniforms uniforms = uniformsArray.uniforms[min(int(amplificationID), kMaxViewCount)];
 
     uint splatID = instanceID * uniforms.indexedSplatCount + (vertexID / 4);
@@ -43,10 +45,13 @@ vertex FragmentIn singleStageSplatVertexShader(uint vertexID [[vertex_id]],
 
     return splatVertex(splat, uniforms, vertexID % 4,
                        chunk.shCoefficients, chunk.shDegree,
-                       idx.splatIndex);
+                       idx.splatIndex, cuts, hullTex);
 }
 
-fragment half4 singleStageSplatFragmentShader(FragmentIn in [[stage_in]]) {
+fragment half4 singleStageSplatFragmentShader(FragmentIn in [[stage_in]],
+                                              constant ViewCutsUniforms & cuts [[ buffer(BufferIndexViewCuts) ]],
+                                              texture2d<float> hullTex [[ texture(TextureIndexHull) ]]) {
+    if (splatCutHidden(in, cuts, hullTex)) discard_fragment();
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
     return half4(alpha * in.color.rgb, alpha);
 }

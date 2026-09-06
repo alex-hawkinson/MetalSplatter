@@ -50,6 +50,112 @@ public final class SplatRenderer: @unchecked Sendable {
         case uniforms    = 0
         case chunks      = 1
         case splatIndex  = 2
+        case viewCuts    = 3
+    }
+
+    enum TextureIndex: NSInteger {
+        case hull = 0
+    }
+
+    // MARK: - View cuts (host-frame clipping of the rendered splats)
+
+    /// A fitted floor-plane hull: a 2-D signed-distance texture (r16Float,
+    /// CELLS, negative inside, sampled bilinear / clamp-to-edge with an
+    /// exterior ring) plus the frame that maps a world point onto it.
+    /// Fragments whose floor-plane projection reads past `clipCells`, or whose
+    /// height along `up` leaves [floor, top], are hidden.
+    public struct HullClip: @unchecked Sendable {
+        public var texture: MTLTexture
+        public var e1: SIMD3<Float>
+        public var e2: SIMD3<Float>
+        public var up: SIMD3<Float>
+        public var origin: SIMD2<Float>
+        public var invSize: SIMD2<Float>
+        public var floor: Float
+        public var top: Float
+        public var clipCells: Float
+        public var invCell: Float
+        public init(texture: MTLTexture, e1: SIMD3<Float>, e2: SIMD3<Float>, up: SIMD3<Float>,
+                    origin: SIMD2<Float>, invSize: SIMD2<Float>, floor: Float, top: Float,
+                    clipCells: Float, invCell: Float) {
+            self.texture = texture; self.e1 = e1; self.e2 = e2; self.up = up
+            self.origin = origin; self.invSize = invSize; self.floor = floor; self.top = top
+            self.clipCells = clipCells; self.invCell = invCell
+        }
+    }
+
+    /// View cuts in the frame `SplatChunk` positions live in. Up to two planes
+    /// (hide where dot(p, xyz) > w) and two spheres (hide where distance(p,
+    /// xyz) > w), plus an optional hull. Applied PER FRAGMENT on the
+    /// billboard-plane world position, so a gaussian straddling a cut is
+    /// clipped rather than dropped; the vertex stage culls only gaussians
+    /// whose whole disc is past a cut. Empty = no cut.
+    public struct ViewCuts: @unchecked Sendable {
+        public var planes: [SIMD4<Float>] = []
+        public var spheres: [SIMD4<Float>] = []
+        public var hull: HullClip? = nil
+        public init(planes: [SIMD4<Float>] = [], spheres: [SIMD4<Float>] = [], hull: HullClip? = nil) {
+            self.planes = planes; self.spheres = spheres; self.hull = hull
+        }
+        public static let none = ViewCuts()
+        static let parkedPlane = SIMD4<Float>(0, -1, 0, 1e9)
+        static let parkedSphere = SIMD4<Float>(0, 0, 0, 1e9)
+    }
+
+    /// The cuts applied on the next render. Set from the thread that calls
+    /// render(); the value is copied into the frame's uniform ring slot.
+    public var viewCuts = ViewCuts()
+
+    /// How the render pass treats what is already in the color / depth
+    /// attachments. The default clears both (the historical behaviour). A
+    /// host that pre-draws opaque geometry into the SAME textures (with depth)
+    /// sets both load actions to `.load` and a real depth compare (`.less`
+    /// for a standard 0-near projection) so splats behind that geometry are
+    /// hidden — the splat pass never writes depth over it (`depthWrite` stays
+    /// the renderer's own rule).
+    public struct RenderPassPolicy: Sendable {
+        public var colorLoadAction: MTLLoadAction = .clear
+        public var depthLoadAction: MTLLoadAction = .clear
+        public var depthClear: Double = 0.0
+        public var depthCompare: MTLCompareFunction = .always
+        public init() {}
+    }
+    public var passPolicy = RenderPassPolicy()
+
+    // Keep in sync with ShaderCommon.h : ViewCutsUniforms
+    struct ViewCutsUniforms {
+        var plane0: SIMD4<Float>
+        var plane1: SIMD4<Float>
+        var sphere0: SIMD4<Float>
+        var sphere1: SIMD4<Float>
+        var hullE1On: SIMD4<Float>
+        var hullE2Floor: SIMD4<Float>
+        var hullUpTop: SIMD4<Float>
+        var hullOriginInvSize: SIMD4<Float>
+        var hullMarginInvCell: SIMD4<Float>
+        static var alignedSize: Int { (MemoryLayout<ViewCutsUniforms>.size + 0xFF) & -0x100 }
+
+        init(_ cuts: ViewCuts) {
+            let p = cuts.planes
+            let s = cuts.spheres
+            plane0 = p.count > 0 ? p[0] : ViewCuts.parkedPlane
+            plane1 = p.count > 1 ? p[1] : ViewCuts.parkedPlane
+            sphere0 = s.count > 0 ? s[0] : ViewCuts.parkedSphere
+            sphere1 = s.count > 1 ? s[1] : ViewCuts.parkedSphere
+            if let h = cuts.hull {
+                hullE1On = SIMD4<Float>(h.e1, 1)
+                hullE2Floor = SIMD4<Float>(h.e2, h.floor)
+                hullUpTop = SIMD4<Float>(h.up, h.top)
+                hullOriginInvSize = SIMD4<Float>(h.origin.x, h.origin.y, h.invSize.x, h.invSize.y)
+                hullMarginInvCell = SIMD4<Float>(h.clipCells, h.invCell, 0, 0)
+            } else {
+                hullE1On = SIMD4<Float>(1, 0, 0, 0)
+                hullE2Floor = SIMD4<Float>(0, 0, 1, -1e9)
+                hullUpTop = SIMD4<Float>(0, 1, 0, 1e9)
+                hullOriginInvSize = SIMD4<Float>(0, 0, 0, 0)
+                hullMarginInvCell = SIMD4<Float>(0, 0, 0, 0)
+            }
+        }
     }
 
     // Keep in sync with Shaders.metal : Uniforms
@@ -152,6 +258,12 @@ public final class SplatRenderer: @unchecked Sendable {
 
     private let library: MTLLibrary
 
+    /// Ring of per-frame view-cut uniform slots (one per simultaneous render).
+    private let viewCutsBuffers: MTLBuffer
+    /// 1x1 r16Float "+16 cells" (far outside) texture bound when no hull is set,
+    /// so the hull sampler never reads an unbound texture.
+    private let parkedHullTexture: MTLTexture
+
     // MARK: - Chunk Storage
 
     /// Internal storage for a chunk
@@ -197,6 +309,9 @@ public final class SplatRenderer: @unchecked Sendable {
         var uniformBufferOffset: Int = 0
         var uniformBufferIndex: Int = 0
         var uniforms: UnsafeMutablePointer<UniformsArray>
+
+        // The depth compare the depth-stencil states were built for (passPolicy may change it)
+        var builtDepthCompare: MTLCompareFunction = .always
 
         // Index buffer for triangle vertices (grown as needed)
         var triangleVertexIndexBuffer: MetalBuffer<UInt32>
@@ -281,6 +396,17 @@ public final class SplatRenderer: @unchecked Sendable {
         self.dynamicUniformBuffers = device.makeBuffer(length: dynamicUniformBuffersSize,
                                                        options: .storageModeShared)!
         self.dynamicUniformBuffers.label = "Uniform Buffers"
+
+        self.viewCutsBuffers = device.makeBuffer(length: ViewCutsUniforms.alignedSize * maxSimultaneousRenders,
+                                                 options: .storageModeShared)!
+        self.viewCutsBuffers.label = "View Cuts Buffers"
+        let parkedDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: 1, height: 1, mipmapped: false)
+        parkedDesc.usage = .shaderRead
+        parkedDesc.storageMode = .shared
+        self.parkedHullTexture = device.makeTexture(descriptor: parkedDesc)!
+        var farOutside: UInt16 = 0x4C00   // half(+16)
+        self.parkedHullTexture.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,
+                                       withBytes: &farOutside, bytesPerRow: 2)
 
         let uniformsPointer = UnsafeMutableRawPointer(dynamicUniformBuffers.contents())
             .bindMemory(to: UniformsArray.self, capacity: 1)
@@ -487,20 +613,24 @@ public final class SplatRenderer: @unchecked Sendable {
     }
 
     private func buildSingleStagePipelineStatesIfNeeded() throws {
-        guard renderState.singleStagePipelineState == nil else { return }
-
-        renderState.singleStagePipelineState = try buildSingleStagePipelineState()
-        renderState.singleStageDepthState = try buildSingleStageDepthState()
+        if renderState.singleStagePipelineState == nil {
+            renderState.singleStagePipelineState = try buildSingleStagePipelineState()
+        }
+        if renderState.singleStageDepthState == nil {
+            renderState.singleStageDepthState = try buildSingleStageDepthState()
+        }
     }
 
     private func buildMultiStagePipelineStatesIfNeeded() throws {
-        guard renderState.initializePipelineState == nil else { return }
-
-        renderState.initializePipelineState = try buildInitializePipelineState()
-        renderState.drawSplatPipelineState = try buildDrawSplatPipelineState()
-        renderState.drawSplatDepthState = try buildDrawSplatDepthState()
-        renderState.postprocessPipelineState = try buildPostprocessPipelineState()
-        renderState.postprocessDepthState = try buildPostprocessDepthState()
+        if renderState.initializePipelineState == nil {
+            renderState.initializePipelineState = try buildInitializePipelineState()
+            renderState.drawSplatPipelineState = try buildDrawSplatPipelineState()
+            renderState.postprocessPipelineState = try buildPostprocessPipelineState()
+            renderState.postprocessDepthState = try buildPostprocessDepthState()
+        }
+        if renderState.drawSplatDepthState == nil {
+            renderState.drawSplatDepthState = try buildDrawSplatDepthState()
+        }
     }
 
     private func buildSingleStagePipelineState() throws -> MTLRenderPipelineState {
@@ -536,9 +666,18 @@ public final class SplatRenderer: @unchecked Sendable {
         assert(!useMultiStagePipeline)
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
-        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.always
+        depthStateDescriptor.depthCompareFunction = passPolicy.depthCompare
         depthStateDescriptor.isDepthWriteEnabled = writeDepth
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
+    }
+
+    /// The depth-stencil states bake the compare function in; a policy change
+    /// rebuilds them (cheap, and it happens once per toggle, never per frame).
+    private func invalidateDepthStatesIfNeeded() {
+        guard renderState.builtDepthCompare != passPolicy.depthCompare else { return }
+        renderState.singleStageDepthState = nil
+        renderState.drawSplatDepthState = nil
+        renderState.builtDepthCompare = passPolicy.depthCompare
     }
 
     private func buildInitializePipelineState() throws -> MTLRenderPipelineState {
@@ -577,7 +716,7 @@ public final class SplatRenderer: @unchecked Sendable {
         assert(useMultiStagePipeline)
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
-        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.always
+        depthStateDescriptor.depthCompareFunction = passPolicy.depthCompare
         depthStateDescriptor.isDepthWriteEnabled = writeDepth
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
@@ -595,7 +734,19 @@ public final class SplatRenderer: @unchecked Sendable {
             ? library.makeRequiredFunction(name: "postprocessFragmentShader")
             : library.makeRequiredFunction(name: "postprocessFragmentShaderNoDepth")
 
-        pipelineDescriptor.colorAttachments[0]!.pixelFormat = colorFormat
+        let colorAttachment = pipelineDescriptor.colorAttachments[0]!
+        colorAttachment.pixelFormat = colorFormat
+        // The tile memory holds premultiplied color; composite it OVER the
+        // attachment (the clear color, or geometry the host pre-drew with
+        // `passPolicy` load actions) instead of replacing it.
+        colorAttachment.isBlendingEnabled = true
+        colorAttachment.rgbBlendOperation = .add
+        colorAttachment.alphaBlendOperation = .add
+        colorAttachment.sourceRGBBlendFactor = .one
+        colorAttachment.sourceAlphaBlendFactor = .one
+        colorAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        colorAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        pipelineDescriptor.colorAttachments[0] = colorAttachment
         pipelineDescriptor.depthAttachmentPixelFormat = depthFormat
 
         pipelineDescriptor.maxVertexAmplificationCount = maxViewCount
@@ -708,14 +859,14 @@ public final class SplatRenderer: @unchecked Sendable {
                        for commandBuffer: MTLCommandBuffer) -> MTLRenderCommandEncoder {
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = colorTexture
-        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].loadAction = passPolicy.colorLoadAction
         renderPassDescriptor.colorAttachments[0].storeAction = colorStoreAction
         renderPassDescriptor.colorAttachments[0].clearColor = clearColor
         if let depthTexture {
             renderPassDescriptor.depthAttachment.texture = depthTexture
-            renderPassDescriptor.depthAttachment.loadAction = .clear
+            renderPassDescriptor.depthAttachment.loadAction = passPolicy.depthLoadAction
             renderPassDescriptor.depthAttachment.storeAction = .store
-            renderPassDescriptor.depthAttachment.clearDepth = 0.0
+            renderPassDescriptor.depthAttachment.clearDepth = passPolicy.depthClear
         }
         renderPassDescriptor.rasterizationRateMap = rasterizationRateMap
         renderPassDescriptor.renderTargetArrayLength = renderTargetArrayLength
@@ -865,7 +1016,15 @@ public final class SplatRenderer: @unchecked Sendable {
             bufferPool.release(chunksBuffer, tag: .chunks)
         }
 
+        // this frame's view cuts ride the same ring slot as the uniforms
+        let cuts = viewCuts
+        let cutsOffset = ViewCutsUniforms.alignedSize * renderState.uniformBufferIndex
+        UnsafeMutableRawPointer(viewCutsBuffers.contents() + cutsOffset)
+            .bindMemory(to: ViewCutsUniforms.self, capacity: 1).pointee = ViewCutsUniforms(cuts)
+        let hullTexture = cuts.hull?.texture ?? parkedHullTexture
+
         let multiStage = useMultiStagePipeline
+        invalidateDepthStatesIfNeeded()
         if multiStage {
             try buildMultiStagePipelineStatesIfNeeded()
         } else {
@@ -924,6 +1083,10 @@ public final class SplatRenderer: @unchecked Sendable {
         renderEncoder.setVertexBuffer(dynamicUniformBuffers, offset: renderState.uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
         renderEncoder.setVertexBuffer(chunksBuffer, offset: 0, index: BufferIndex.chunks.rawValue)
         renderEncoder.setVertexBuffer(splatIndexBuffer.buffer, offset: 0, index: BufferIndex.splatIndex.rawValue)
+        renderEncoder.setVertexBuffer(viewCutsBuffers, offset: cutsOffset, index: BufferIndex.viewCuts.rawValue)
+        renderEncoder.setFragmentBuffer(viewCutsBuffers, offset: cutsOffset, index: BufferIndex.viewCuts.rawValue)
+        renderEncoder.setVertexTexture(hullTexture, index: TextureIndex.hull.rawValue)
+        renderEncoder.setFragmentTexture(hullTexture, index: TextureIndex.hull.rawValue)
 
         // Make splat and SH coefficient buffers resident for all chunks (enabled + disabled).
         // The shader may briefly access disabled chunks' pointers before the enabled check.

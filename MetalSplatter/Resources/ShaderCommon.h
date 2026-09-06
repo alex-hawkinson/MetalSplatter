@@ -40,7 +40,33 @@ enum BufferIndex: int32_t
     BufferIndexUniforms    = 0,
     BufferIndexChunks      = 1,
     BufferIndexSplatIndex  = 2,
+    BufferIndexViewCuts    = 3,
 };
+
+enum TextureIndex: int32_t
+{
+    TextureIndexHull = 0,
+};
+
+// View cuts, stated in the frame `Splat.position` lives in (the host's world).
+// Planes hide where dot(p, xyz) > w; spheres hide where distance(p, xyz) > w;
+// a parked term has w = 1e9. The hull is a 2-D signed-distance field in the
+// floor plane (texture, CELLS, negative inside): grid (u,v) = ((p·e1, p·e2) −
+// origin) · invSize; fragments past `margin` cells or outside [floor, top]
+// along `up` are hidden. Every test runs PER FRAGMENT on the billboard-plane
+// world position, so a straddling gaussian is clipped, not dropped; the vertex
+// stage only culls a gaussian whose whole disc is past a cut.
+// Keep in sync with Swift: ViewCutsUniforms
+typedef struct
+{
+    float4 planes[2];
+    float4 spheres[2];
+    float4 hullE1On;          // xyz = e1, w = hull on (> 0.5)
+    float4 hullE2Floor;       // xyz = e2, w = floor (along up)
+    float4 hullUpTop;         // xyz = up, w = top (along up)
+    float4 hullOriginInvSize; // xy = origin along (e1, e2), zw = 1 / (w·cell, h·cell)
+    float4 hullMarginInvCell; // x = clip margin (cells), y = 1 / cell, zw unused
+} ViewCutsUniforms;
 
 typedef struct
 {
@@ -105,4 +131,6 @@ typedef struct
     float4 position [[position]];
     half2 relativePosition; // Ranges from -kBoundsRadius to +kBoundsRadius
     half4 color;
+    float3 worldPosition;   // this fragment on the camera-facing plane through the center (host world frame)
+    float hullNear [[flat]]; // 1 = the disc may cross the hull boundary: the fragment must sample
 } FragmentIn;

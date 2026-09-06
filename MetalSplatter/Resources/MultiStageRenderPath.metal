@@ -29,7 +29,9 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
                                               ushort amplificationID [[amplification_id]],
                                               device const ChunkInfo* chunks [[ buffer(BufferIndexChunks) ]],
                                               constant ChunkedSplatIndex* splatIndexArray [[ buffer(BufferIndexSplatIndex) ]],
-                                              constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]]) {
+                                              constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]],
+                                              constant ViewCutsUniforms & cuts [[ buffer(BufferIndexViewCuts) ]],
+                                              texture2d<float> hullTex [[ texture(TextureIndexHull) ]]) {
     Uniforms uniforms = uniformsArray.uniforms[min(int(amplificationID), kMaxViewCount)];
 
     uint splatID = instanceID * uniforms.indexedSplatCount + (vertexID / 4);
@@ -67,12 +69,18 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
 
     return splatVertex(splat, uniforms, vertexID % 4,
                        chunk.shCoefficients, chunk.shDegree,
-                       idx.splatIndex);
+                       idx.splatIndex, cuts, hullTex);
 }
 
 fragment FragmentStore multiStageSplatFragmentShader(FragmentIn in [[stage_in]],
-                                                     FragmentValues previousFragmentValues [[imageblock_data]]) {
+                                                     FragmentValues previousFragmentValues [[imageblock_data]],
+                                                     constant ViewCutsUniforms & cuts [[ buffer(BufferIndexViewCuts) ]],
+                                                     texture2d<float> hullTex [[ texture(TextureIndexHull) ]]) {
     FragmentStore out;
+    if (splatCutHidden(in, cuts, hullTex)) {
+        out.values = previousFragmentValues;   // a hidden fragment leaves the tile untouched
+        return out;
+    }
 
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
     half4 colorWithPremultipliedAlpha = half4(in.color.rgb * alpha, alpha);

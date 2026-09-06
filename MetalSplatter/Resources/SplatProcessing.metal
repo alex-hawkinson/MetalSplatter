@@ -145,13 +145,19 @@ void decomposeCovariance(float3 cov2D, thread float2 &v1, thread float2 &v2) {
     v2 = eigenvector2 * sqrt(lambda2);
 }
 
+constexpr sampler kHullSampler(filter::linear, address::clamp_to_edge, coord::normalized);
+
 FragmentIn splatVertex(Splat splat,
                        Uniforms uniforms,
                        uint relativeVertexIndex,
                        device const half* shCoefficients,
                        SHDegree shDegree,
-                       uint splatIndex) {
+                       uint splatIndex,
+                       constant ViewCutsUniforms& cuts,
+                       texture2d<float> hullTex) {
     FragmentIn out;
+    out.hullNear = 0;
+    out.worldPosition = float3(splat.position);
 
     float4 viewPosition4 = uniforms.viewMatrix * float4(splat.position, 1);
     float3 viewPosition3 = viewPosition4.xyz;
@@ -161,6 +167,46 @@ FragmentIn splatVertex(Splat splat,
     if (viewPosition3.z >= 0) {
         out.position = float4(1, 1, 0, 1);
         return out;
+    }
+
+    // View cuts: a CONSERVATIVE whole-gaussian cull. Every drawn fragment
+    // (|rel| <= kBoundsRadius sigma) reconstructs within `ext` of the center
+    // on the billboard plane:
+    //   ext = kBoundsRadius * (k * sigmaMax + sqrt(0.3) * depth / focal),
+    //   k = |viewPos| / depth (off-axis), sigmaMax <= sqrt(trace(cov3D))
+    // — so a center farther than ext past a cut has NO fragment on the kept
+    // side. Straddlers fall through to the per-fragment test. Parked cuts
+    // (w = 1e9) never fire. Do not tighten this to an anisotropic bound: the
+    // fragment test sees the billboard disc, whose extent along a cut normal
+    // is ext regardless of the gaussian's thickness.
+    float3 worldP = float3(splat.position);
+    float depth = -viewPosition3.z;
+    float offAxis = length(viewPosition3) / depth;
+    float trace3 = float(splat.covA.x) + float(splat.covB.x) + float(splat.covB.z);
+    float focalMin = max(min(uniforms.focalX, uniforms.focalY), 1e-3f);
+    float ext = float(kBoundsRadius) * (offAxis * sqrt(max(trace3, 0.0f)) + 0.5477f * depth / focalMin);
+    if (dot(worldP, cuts.planes[0].xyz) - cuts.planes[0].w > ext ||
+        dot(worldP, cuts.planes[1].xyz) - cuts.planes[1].w > ext ||
+        distance(worldP, cuts.spheres[0].xyz) - cuts.spheres[0].w > ext ||
+        distance(worldP, cuts.spheres[1].xyz) - cuts.spheres[1].w > ext) {
+        out.position = float4(1, 1, 0, 1);
+        return out;
+    }
+    if (cuts.hullE1On.w > 0.5f) {
+        float hC = dot(worldP, cuts.hullUpTop.xyz);
+        float2 uvC = (float2(dot(worldP, cuts.hullE1On.xyz), dot(worldP, cuts.hullE2Floor.xyz))
+                      - cuts.hullOriginInvSize.xy) * cuts.hullOriginInvSize.zw;
+        float sC = hullTex.sample(kHullSampler, uvC, level(0)).r;   // cells; off-grid clamps to the exterior ring
+        float margin = cuts.hullMarginInvCell.x;
+        // a bilinear SDF is sqrt(2)-Lipschitz along diagonals; +1 cell for center-vs-corner sampling
+        float extC = 1.5f * ext * cuts.hullMarginInvCell.y + 1.0f;
+        float top = cuts.hullUpTop.w;
+        float floorH = cuts.hullE2Floor.w;
+        if (sC - margin > extC || hC - top > ext || floorH - hC > ext) {
+            out.position = float4(1, 1, 0, 1);
+            return out;
+        }
+        if (sC - margin > -extC || hC - top > -ext || floorH - hC > -ext) out.hullNear = 1;
     }
 
     half3 srgbColor;
@@ -210,9 +256,40 @@ FragmentIn splatVertex(Splat splat,
                           projectedCenter.w);
     out.relativePosition = kBoundsRadius * relativeCoordinates;
 
+    // World position of this corner on the camera-facing plane through the
+    // center: pixel offset -> camera units at the center's depth -> world via
+    // the rigid inverse view rotation. Affine in the corner coordinates with a
+    // constant w, so the interpolated value is exact — and it uses the SAME
+    // axes as the drawn quad.
+    float2 pixelOffset = (float(relativeCoordinates.x) * axis1 + float(relativeCoordinates.y) * axis2)
+                         * float(kBoundsRadius);
+    float3 cameraOffset = float3(pixelOffset.x * depth / max(uniforms.focalX, 1e-3f),
+                                 pixelOffset.y * depth / max(uniforms.focalY, 1e-3f),
+                                 0.0f);
+    float3x3 viewRotation = float3x3(uniforms.viewMatrix[0].xyz, uniforms.viewMatrix[1].xyz, uniforms.viewMatrix[2].xyz);
+    out.worldPosition = worldP + transpose(viewRotation) * cameraOffset;
+
     // Convert from sRGB to linear to match Metal expectations for shader color output
     out.color = half4(sRGBToLinear(srgbColor), splat.color.a);
     return out;
+}
+
+bool splatCutHidden(FragmentIn in,
+                    constant ViewCutsUniforms& cuts,
+                    texture2d<float> hullTex) {
+    float3 p = in.worldPosition;
+    if (dot(p, cuts.planes[0].xyz) > cuts.planes[0].w ||
+        dot(p, cuts.planes[1].xyz) > cuts.planes[1].w ||
+        distance(p, cuts.spheres[0].xyz) > cuts.spheres[0].w ||
+        distance(p, cuts.spheres[1].xyz) > cuts.spheres[1].w) return true;
+    if (cuts.hullE1On.w > 0.5f && in.hullNear > 0.5f) {
+        float h = dot(p, cuts.hullUpTop.xyz);
+        if (h < cuts.hullE2Floor.w || h > cuts.hullUpTop.w) return true;
+        float2 uv = (float2(dot(p, cuts.hullE1On.xyz), dot(p, cuts.hullE2Floor.xyz))
+                     - cuts.hullOriginInvSize.xy) * cuts.hullOriginInvSize.zw;
+        if (hullTex.sample(kHullSampler, uv, level(0)).r > cuts.hullMarginInvCell.x) return true;
+    }
+    return false;
 }
 
 half splatFragmentAlpha(half2 relativePosition, half splatAlpha) {
