@@ -118,6 +118,13 @@ public final class SplatRenderer: @unchecked Sendable {
         public var depthLoadAction: MTLLoadAction = .clear
         public var depthClear: Double = 0.0
         public var depthCompare: MTLCompareFunction = .always
+        /// Whether the splat draw writes depth. nil = the renderer's default
+        /// (write whenever a depth attachment exists). A host that depth-tests
+        /// the gaussians against geometry it drew first (`depthCompare` other
+        /// than `.always`) must set this false: the splats are drawn in sort
+        /// order, and a splat that wrote its own depth would then occlude
+        /// every later, nearer splat's fragments — hard quad-shaped cutouts.
+        public var depthWrite: Bool? = nil
         public init() {}
     }
     public var passPolicy = RenderPassPolicy()
@@ -310,8 +317,9 @@ public final class SplatRenderer: @unchecked Sendable {
         var uniformBufferIndex: Int = 0
         var uniforms: UnsafeMutablePointer<UniformsArray>
 
-        // The depth compare the depth-stencil states were built for (passPolicy may change it)
+        // The depth compare + write the depth-stencil states were built for (passPolicy may change them)
         var builtDepthCompare: MTLCompareFunction = .always
+        var builtDepthWrite: Bool? = nil
 
         // Index buffer for triangle vertices (grown as needed)
         var triangleVertexIndexBuffer: MetalBuffer<UInt32>
@@ -667,17 +675,19 @@ public final class SplatRenderer: @unchecked Sendable {
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
         depthStateDescriptor.depthCompareFunction = passPolicy.depthCompare
-        depthStateDescriptor.isDepthWriteEnabled = writeDepth
+        depthStateDescriptor.isDepthWriteEnabled = passPolicy.depthWrite ?? writeDepth
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
 
     /// The depth-stencil states bake the compare function in; a policy change
     /// rebuilds them (cheap, and it happens once per toggle, never per frame).
     private func invalidateDepthStatesIfNeeded() {
-        guard renderState.builtDepthCompare != passPolicy.depthCompare else { return }
+        guard renderState.builtDepthCompare != passPolicy.depthCompare
+                || renderState.builtDepthWrite != passPolicy.depthWrite else { return }
         renderState.singleStageDepthState = nil
         renderState.drawSplatDepthState = nil
         renderState.builtDepthCompare = passPolicy.depthCompare
+        renderState.builtDepthWrite = passPolicy.depthWrite
     }
 
     private func buildInitializePipelineState() throws -> MTLRenderPipelineState {
@@ -717,7 +727,7 @@ public final class SplatRenderer: @unchecked Sendable {
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
         depthStateDescriptor.depthCompareFunction = passPolicy.depthCompare
-        depthStateDescriptor.isDepthWriteEnabled = writeDepth
+        depthStateDescriptor.isDepthWriteEnabled = passPolicy.depthWrite ?? writeDepth
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
 
