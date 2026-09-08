@@ -32,8 +32,14 @@ FragmentIn splatVertex(Splat splat,
                        uint relativeVertexIndex,
                        device const half* shCoefficients,
                        SHDegree shDegree,
-                       uint splatIndex);
+                       uint splatIndex,
+                       constant ObjectCropUniforms &crop,
+                       uint viewIndex);
 
 // MARK: - Fragment Processing
 
 half splatFragmentAlpha(half2 relativePosition, half splatAlpha);
+
+bool splatFragmentInsideCrop(float4 modelPosition,
+                             constant ObjectCropUniforms &crop,
+                             constant float4 *planes);
