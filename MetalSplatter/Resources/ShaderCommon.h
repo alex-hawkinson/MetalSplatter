@@ -4,6 +4,7 @@
 using namespace metal;
 
 constant const int kMaxViewCount = 2;
+constant const uint kMaxObjectCropPlanes = 20;
 constant static const half kBoundsRadius = 3;
 constant static const half kBoundsRadiusSquared = kBoundsRadius*kBoundsRadius;
 
@@ -40,7 +41,20 @@ enum BufferIndex: int32_t
     BufferIndexUniforms    = 0,
     BufferIndexChunks      = 1,
     BufferIndexSplatIndex  = 2,
+    BufferIndexObjectCrop = 3,
+    BufferIndexObjectCropPlanes = 4,
 };
+
+// Keep in sync with Swift: ObjectCropUniforms (144 bytes).
+// These matrices invert the complete projection * view supplied by the caller,
+// including any object transform folded into viewMatrix.
+typedef struct
+{
+    matrix_float4x4 clipToModel[kMaxViewCount];
+    uint planeCount;
+    uint strictPlaneMask;
+    uint2 _padding;
+} ObjectCropUniforms;
 
 typedef struct
 {
@@ -105,4 +119,7 @@ typedef struct
     float4 position [[position]];
     half2 relativePosition; // Ranges from -kBoundsRadius to +kBoundsRadius
     half4 color;
+    // Perspective interpolation preserves the exact rendered billboard position.
+    // Divide xyz by w in the fragment shader to recover input-splat coordinates.
+    float4 modelPosition [[center_perspective]];
 } FragmentIn;

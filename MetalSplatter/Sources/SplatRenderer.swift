@@ -4,6 +4,7 @@ import MetalKit
 import os
 import SplatIO
 import Synchronization
+import simd
 
 public final class SplatRenderer: @unchecked Sendable {
     enum Constants {
@@ -45,11 +46,99 @@ public final class SplatRenderer: @unchecked Sendable {
         }
     }
 
+    public enum ConvexCropError: Error {
+        case invalidPlane
+        case tooManyPlanes
+        case invalidViewport
+    }
+
+    /// An inward halfspace in the coordinate frame of the input splat positions.
+    /// Retains fragments where dot(normal, position) - offset is nonnegative
+    /// (strictly positive when `strict` is true). Coefficients are not rescaled.
+    public struct CropPlane: Sendable {
+        public let normal: SIMD3<Float>
+        public let offset: Float
+        public let strict: Bool
+
+        public init(normal: SIMD3<Float>, offset: Float, strict: Bool = false) throws {
+            guard normal.x.isFinite, normal.y.isFinite, normal.z.isFinite,
+                  normal != .zero, offset.isFinite else {
+                throw ConvexCropError.invalidPlane
+            }
+            self.normal = normal
+            self.offset = offset
+            self.strict = strict
+        }
+    }
+
+    /// Immutable, render-local intersection of at most twenty inward planes.
+    /// Applies to every enabled chunk in the same input coordinate frame.
+    /// An empty crop, or nil at render time, disables cropping. This clips the
+    /// rendered billboard fragments; it does not modify or remove stored splats.
+    public struct ConvexCrop: Sendable {
+        public static let maximumPlaneCount = 20
+        let encodedPlanes: [SIMD4<Float>]
+        let strictPlaneMask: UInt32
+
+        public init(planes: [CropPlane]) throws {
+            guard planes.count <= Self.maximumPlaneCount else {
+                throw ConvexCropError.tooManyPlanes
+            }
+            self.encodedPlanes = planes.map { SIMD4($0.normal, $0.offset) }
+            self.strictPlaneMask = planes.enumerated().reduce(UInt32(0)) { mask, item in
+                mask | (item.element.strict ? UInt32(1) << UInt32(item.offset) : 0)
+            }
+        }
+    }
+
     // Keep in sync with Shaders.metal : BufferIndex
     enum BufferIndex: NSInteger {
         case uniforms    = 0
         case chunks      = 1
         case splatIndex  = 2
+        case objectCrop = 3
+        case objectCropPlanes = 4
+    }
+
+    // Keep in sync with ShaderCommon.h: ObjectCropUniforms. Two 64-byte
+    // matrices, then four UInt32 values: stride 144, alignment 16.
+    struct ObjectCropUniforms {
+        var clipToModel0: simd_float4x4 = matrix_identity_float4x4
+        var clipToModel1: simd_float4x4 = matrix_identity_float4x4
+        var planeCount: UInt32 = 0
+        var strictPlaneMask: UInt32 = 0
+        var _padding: SIMD2<UInt32> = .zero
+    }
+
+    static func objectCropUniforms(_ crop: ConvexCrop?,
+                                   viewports: [ViewportDescriptor],
+                                   maxViewCount: Int) throws -> ObjectCropUniforms {
+        var result = ObjectCropUniforms()
+        guard let crop, !crop.encodedPlanes.isEmpty else { return result }
+        guard !viewports.isEmpty,
+              viewports.count <= min(maxViewCount, Constants.maxViewCount) else {
+            throw ConvexCropError.invalidViewport
+        }
+        for (i, viewport) in viewports.enumerated() {
+            let modelToClip = viewport.projectionMatrix * viewport.viewMatrix
+            let determinant = simd_determinant(modelToClip)
+            guard (0..<4).allSatisfy({ column in
+                (0..<4).allSatisfy { modelToClip[column][$0].isFinite }
+            }), determinant.isFinite, determinant != 0 else {
+                throw ConvexCropError.invalidViewport
+            }
+            let clipToModel = modelToClip.inverse
+            guard (0..<4).allSatisfy({ column in
+                (0..<4).allSatisfy { clipToModel[column][$0].isFinite }
+            }) else {
+                throw ConvexCropError.invalidViewport
+            }
+            if i == 0 { result.clipToModel0 = clipToModel }
+            else { result.clipToModel1 = clipToModel }
+        }
+        result.planeCount = UInt32(crop.encodedPlanes.count)
+        result.strictPlaneMask = crop.strictPlaneMask
+        return result
     }
 
     // Keep in sync with Shaders.metal : Uniforms
@@ -276,6 +365,9 @@ public final class SplatRenderer: @unchecked Sendable {
         self.maxSimultaneousRenders = maxSimultaneousRenders
         self.highQualityDepth = highQualityDepth
         self.clearColor = clearColor
+
+        precondition(MemoryLayout<ObjectCropUniforms>.stride == 144,
+                     "Object crop uniforms must match the Metal shader layout")
 
         let dynamicUniformBuffersSize = UniformsArray.alignedSize * maxSimultaneousRenders
         self.dynamicUniformBuffers = device.makeBuffer(length: dynamicUniformBuffersSize,
@@ -759,6 +851,10 @@ public final class SplatRenderer: @unchecked Sendable {
     ///   - depthTexture: Optional depth texture for depth output
     ///   - rasterizationRateMap: Optional rasterization rate map for variable rate shading
     ///   - renderTargetArrayLength: The render target array length (for layered rendering)
+    ///   - crop: Optional immutable crop in input-splat coordinates. Pass a snapshot
+    ///     taken under the app's existing render-state lock. Plane bytes and inverse
+    ///     matrices are copied into this command encoder and never retained as renderer
+    ///     state. Nil restores the original rendering behavior on the next call.
     ///   - accessTimeout: Maximum time to block waiting for render access (when exclusive chunk access is held, or when maxSimultaneousRenders are already in flight). Defaults to 0.1s.
     ///   - sortTimeout: Maximum time to block the caller in order to wait for a valid sorted index buffer to be available. This does not cause the method to wait for the latest sort to complete, it only causes it to block if no sort at all has completed since the last time the sort was invalidated (e.g. if chunks were changed). Passing 0 disables blocking, but may result in a flash after a chunk update instead of a dropped frame. Defaults to blocking 0.1s.
     ///   - commandBuffer: The command buffer to encode rendering commands into
@@ -770,6 +866,7 @@ public final class SplatRenderer: @unchecked Sendable {
                        depthTexture: MTLTexture?,
                        rasterizationRateMap: MTLRasterizationRateMap?,
                        renderTargetArrayLength: Int,
+                       crop: ConvexCrop? = nil,
                        accessTimeout: TimeInterval = 0.1,
                        sortTimeout: TimeInterval = 0.1,
                        to commandBuffer: MTLCommandBuffer) throws -> Bool {
@@ -813,6 +910,13 @@ public final class SplatRenderer: @unchecked Sendable {
                 renderCompleted()
             }
         }
+
+        // Render access has been acquired. Enabled cropping rejects invalid
+        // inverse transforms before encoding; the disabled path does no inversion.
+        var cropUniforms = try Self.objectCropUniforms(crop, viewports: viewports,
+                                                       maxViewCount: maxViewCount)
+        let encodedPlanes = crop?.encodedPlanes ?? []
+        let cropPlanes: [SIMD4<Float>] = encodedPlanes.isEmpty ? [.zero] : encodedPlanes
 
         // Build ordered list of all chunks (enabled + disabled); array index = chunk index
         let allChunks: [ChunkEntry] = orderedChunkIDs.compactMap { chunks[$0] }
@@ -924,6 +1028,17 @@ public final class SplatRenderer: @unchecked Sendable {
         renderEncoder.setVertexBuffer(dynamicUniformBuffers, offset: renderState.uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
         renderEncoder.setVertexBuffer(chunksBuffer, offset: 0, index: BufferIndex.chunks.rawValue)
         renderEncoder.setVertexBuffer(splatIndexBuffer.buffer, offset: 0, index: BufferIndex.splatIndex.rawValue)
+        // set*Bytes copies these small values into command-buffer-owned storage;
+        // subsequent renders cannot overwrite an in-flight crop or stereo matrix.
+        renderEncoder.setVertexBytes(&cropUniforms, length: MemoryLayout<ObjectCropUniforms>.stride,
+                                     index: BufferIndex.objectCrop.rawValue)
+        renderEncoder.setFragmentBytes(&cropUniforms, length: MemoryLayout<ObjectCropUniforms>.stride,
+                                       index: BufferIndex.objectCrop.rawValue)
+        cropPlanes.withUnsafeBufferPointer { planes in
+            renderEncoder.setFragmentBytes(planes.baseAddress!,
+                                           length: planes.count * MemoryLayout<SIMD4<Float>>.stride,
+                                           index: BufferIndex.objectCropPlanes.rawValue)
+        }
 
         // Make splat and SH coefficient buffers resident for all chunks (enabled + disabled).
         // The shader may briefly access disabled chunks' pointers before the enabled check.

@@ -150,8 +150,10 @@ FragmentIn splatVertex(Splat splat,
                        uint relativeVertexIndex,
                        device const half* shCoefficients,
                        SHDegree shDegree,
-                       uint splatIndex) {
-    FragmentIn out;
+                       uint splatIndex,
+                       constant ObjectCropUniforms &crop,
+                       uint viewIndex) {
+    FragmentIn out = {};
 
     float4 viewPosition4 = uniforms.viewMatrix * float4(splat.position, 1);
     float3 viewPosition3 = viewPosition4.xyz;
@@ -210,6 +212,12 @@ FragmentIn splatVertex(Splat splat,
                           projectedCenter.w);
     out.relativePosition = kBoundsRadius * relativeCoordinates;
 
+    if (crop.planeCount != 0) {
+        // Unproject the actual emitted billboard vertex, not the Gaussian
+        // center or an estimated 3D extent. Existing clip position is unchanged.
+        out.modelPosition = crop.clipToModel[viewIndex] * out.position;
+    }
+
     // Convert from sRGB to linear to match Metal expectations for shader color output
     out.color = half4(sRGBToLinear(srgbColor), splat.color.a);
     return out;
@@ -218,4 +226,25 @@ FragmentIn splatVertex(Splat splat,
 half splatFragmentAlpha(half2 relativePosition, half splatAlpha) {
     half negativeMagnitudeSquared = -dot(relativePosition, relativePosition);
     return (negativeMagnitudeSquared < -kBoundsRadiusSquared) ? 0 : exp(0.5 * negativeMagnitudeSquared) * splatAlpha;
+}
+
+bool splatFragmentInsideCrop(float4 modelPosition,
+                             constant ObjectCropUniforms &crop,
+                             constant float4 *planes) {
+    if (crop.planeCount == 0) {
+        return true;
+    }
+    if (crop.planeCount > kMaxObjectCropPlanes ||
+        !all(isfinite(modelPosition)) || modelPosition.w == 0) {
+        return false;
+    }
+    float3 point = modelPosition.xyz / modelPosition.w;
+    for (uint i = 0; i < crop.planeCount; ++i) {
+        float distance = dot(planes[i].xyz, point) - planes[i].w;
+        bool strict = (crop.strictPlaneMask & (1u << i)) != 0;
+        if (!isfinite(distance) || (strict ? distance <= 0 : distance < 0)) {
+            return false;
+        }
+    }
+    return true;
 }

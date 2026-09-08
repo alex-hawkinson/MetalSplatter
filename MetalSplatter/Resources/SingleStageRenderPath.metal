@@ -5,8 +5,10 @@ vertex FragmentIn singleStageSplatVertexShader(uint vertexID [[vertex_id]],
                                                ushort amplificationID [[amplification_id]],
                                                device const ChunkInfo* chunks [[ buffer(BufferIndexChunks) ]],
                                                constant ChunkedSplatIndex* splatIndexArray [[ buffer(BufferIndexSplatIndex) ]],
-                                               constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]]) {
-    Uniforms uniforms = uniformsArray.uniforms[min(int(amplificationID), kMaxViewCount)];
+                                               constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]],
+                                               constant ObjectCropUniforms &crop [[ buffer(BufferIndexObjectCrop) ]]) {
+    uint viewIndex = min(uint(amplificationID), uint(kMaxViewCount - 1));
+    Uniforms uniforms = uniformsArray.uniforms[viewIndex];
 
     uint splatID = instanceID * uniforms.indexedSplatCount + (vertexID / 4);
     if (splatID >= uniforms.splatCount) {
@@ -43,10 +45,15 @@ vertex FragmentIn singleStageSplatVertexShader(uint vertexID [[vertex_id]],
 
     return splatVertex(splat, uniforms, vertexID % 4,
                        chunk.shCoefficients, chunk.shDegree,
-                       idx.splatIndex);
+                       idx.splatIndex, crop, viewIndex);
 }
 
-fragment half4 singleStageSplatFragmentShader(FragmentIn in [[stage_in]]) {
+fragment half4 singleStageSplatFragmentShader(FragmentIn in [[stage_in]],
+                                              constant ObjectCropUniforms &crop [[ buffer(BufferIndexObjectCrop) ]],
+                                              constant float4 *planes [[ buffer(BufferIndexObjectCropPlanes) ]]) {
+    if (!splatFragmentInsideCrop(in.modelPosition, crop, planes)) {
+        discard_fragment();
+    }
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
     return half4(alpha * in.color.rgb, alpha);
 }
