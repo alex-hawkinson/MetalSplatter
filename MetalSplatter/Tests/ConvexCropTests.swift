@@ -73,6 +73,10 @@ final class ConvexCropTests: XCTestCase {
         invalid[1][2] = .nan
         XCTAssertThrowsError(try SplatRenderer.objectCropUniforms(crop,
             viewports: [viewport(invalid)], maxViewCount: 1))
+        let huge = simd_float4x4(columns: (SIMD4(1e10, 0, 0, 0), SIMD4(0, 1e10, 0, 0),
+                                          SIMD4(0, 0, 1e10, 0), SIMD4(0, 0, 0, 1e10)))
+        XCTAssertThrowsError(try SplatRenderer.objectCropUniforms(crop,
+            viewports: [viewport(huge)], maxViewCount: 1))
     }
 
     func testBillboardReconstructionUndoesFullObjectTransformForBothEyes() throws {

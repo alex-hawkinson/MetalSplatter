@@ -121,9 +121,10 @@ public final class SplatRenderer: @unchecked Sendable {
         }
         for (i, viewport) in viewports.enumerated() {
             let modelToClip = viewport.projectionMatrix * viewport.viewMatrix
+            let determinant = simd_determinant(modelToClip)
             guard (0..<4).allSatisfy({ column in
                 (0..<4).allSatisfy { modelToClip[column][$0].isFinite }
-            }), simd_determinant(modelToClip) != 0 else {
+            }), determinant.isFinite, determinant != 0 else {
                 throw ConvexCropError.invalidViewport
             }
             let clipToModel = modelToClip.inverse
