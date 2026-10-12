@@ -34,7 +34,9 @@ FragmentIn splatVertex(Splat splat,
                        SHDegree shDegree,
                        uint splatIndex,
                        constant ViewCutsUniforms& cuts,
-                       texture2d<float> hullTex);
+                       texture2d<float> hullTex,
+                       constant ObjectCropUniforms &crop,
+                       uint viewIndex);
 
 // MARK: - View Cuts
 
@@ -47,3 +49,7 @@ bool splatCutHidden(FragmentIn in,
 // MARK: - Fragment Processing
 
 half splatFragmentAlpha(half2 relativePosition, half splatAlpha);
+
+bool splatFragmentInsideCrop(float4 modelPosition,
+                             constant ObjectCropUniforms &crop,
+                             constant float4 *planes);

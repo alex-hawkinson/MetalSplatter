@@ -4,6 +4,7 @@
 using namespace metal;
 
 constant const int kMaxViewCount = 2;
+constant const uint kMaxObjectCropPlanes = 20;
 constant static const half kBoundsRadius = 3;
 constant static const half kBoundsRadiusSquared = kBoundsRadius*kBoundsRadius;
 
@@ -41,6 +42,8 @@ enum BufferIndex: int32_t
     BufferIndexChunks      = 1,
     BufferIndexSplatIndex  = 2,
     BufferIndexViewCuts    = 3,
+    BufferIndexObjectCrop = 4,
+    BufferIndexObjectCropPlanes = 5,
 };
 
 enum TextureIndex: int32_t
@@ -67,6 +70,17 @@ typedef struct
     float4 hullOriginInvSize; // xy = origin along (e1, e2), zw = 1 / (w·cell, h·cell)
     float4 hullMarginInvCell; // x = clip margin (cells), y = 1 / cell, zw unused
 } ViewCutsUniforms;
+
+// Keep in sync with Swift: ObjectCropUniforms (144 bytes).
+// These matrices invert the complete projection * view supplied by the caller,
+// including any object transform folded into viewMatrix.
+typedef struct
+{
+    matrix_float4x4 clipToModel[kMaxViewCount];
+    uint planeCount;
+    uint strictPlaneMask;
+    uint2 _padding;
+} ObjectCropUniforms;
 
 typedef struct
 {
@@ -133,4 +147,7 @@ typedef struct
     half4 color;
     float3 worldPosition;   // this fragment on the camera-facing plane through the center (host world frame)
     float hullNear [[flat]]; // 1 = the disc may cross the hull boundary: the fragment must sample
+    // Perspective interpolation preserves the exact rendered billboard position.
+    // Divide xyz by w in the fragment shader to recover input-splat coordinates.
+    float4 modelPosition [[center_perspective]];
 } FragmentIn;
