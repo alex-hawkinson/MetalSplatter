@@ -30,6 +30,8 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
                                               device const ChunkInfo* chunks [[ buffer(BufferIndexChunks) ]],
                                               constant ChunkedSplatIndex* splatIndexArray [[ buffer(BufferIndexSplatIndex) ]],
                                               constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]],
+                                              constant ViewCutsUniforms & cuts [[ buffer(BufferIndexViewCuts) ]],
+                                              texture2d<float> hullTex [[ texture(TextureIndexHull) ]],
                                               constant ObjectCropUniforms &crop [[ buffer(BufferIndexObjectCrop) ]]) {
     uint viewIndex = min(uint(amplificationID), uint(kMaxViewCount - 1));
     Uniforms uniforms = uniformsArray.uniforms[viewIndex];
@@ -69,17 +71,24 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
 
     return splatVertex(splat, uniforms, vertexID % 4,
                        chunk.shCoefficients, chunk.shDegree,
-                       idx.splatIndex, crop, viewIndex);
+                       idx.splatIndex, cuts, hullTex, crop, viewIndex);
 }
 
 fragment FragmentStore multiStageSplatFragmentShader(FragmentIn in [[stage_in]],
                                                      FragmentValues previousFragmentValues [[imageblock_data]],
+                                                     constant ViewCutsUniforms & cuts [[ buffer(BufferIndexViewCuts) ]],
+                                                     texture2d<float> hullTex [[ texture(TextureIndexHull) ]],
                                                      constant ObjectCropUniforms &crop [[ buffer(BufferIndexObjectCrop) ]],
                                                      constant float4 *planes [[ buffer(BufferIndexObjectCropPlanes) ]]) {
-    if (!splatFragmentInsideCrop(in.modelPosition, crop, planes)) {
-        discard_fragment();
-    }
     FragmentStore out;
+    // Both host clips apply per fragment: the view cuts (planes / spheres /
+    // hull, host world frame) and the convex crop (input-splat frame). A
+    // hidden fragment leaves the tile untouched.
+    if (splatCutHidden(in, cuts, hullTex) ||
+        !splatFragmentInsideCrop(in.modelPosition, crop, planes)) {
+        out.values = previousFragmentValues;
+        return out;
+    }
 
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
     half4 colorWithPremultipliedAlpha = half4(in.color.rgb * alpha, alpha);

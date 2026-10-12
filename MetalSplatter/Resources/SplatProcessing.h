@@ -33,8 +33,18 @@ FragmentIn splatVertex(Splat splat,
                        device const half* shCoefficients,
                        SHDegree shDegree,
                        uint splatIndex,
+                       constant ViewCutsUniforms& cuts,
+                       texture2d<float> hullTex,
                        constant ObjectCropUniforms &crop,
                        uint viewIndex);
+
+// MARK: - View Cuts
+
+/// Per-fragment view-cut test on the billboard-plane world position (planes,
+/// spheres, hull). true = this fragment is hidden.
+bool splatCutHidden(FragmentIn in,
+                    constant ViewCutsUniforms& cuts,
+                    texture2d<float> hullTex);
 
 // MARK: - Fragment Processing
 
